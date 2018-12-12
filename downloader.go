@@ -156,17 +156,15 @@ func make_downloader() Downloader{
 
 func (d Downloader) ServeHTTP(w http.ResponseWriter, r *http.Request){
     if r.Method=="POST"{
-        strings:=[]string{}
-        err:=json.NewDecoder(r.Body).Decode(&strings)
+        s:=""
+        err:=json.NewDecoder(r.Body).Decode(&s)
         if err!=nil{
             fmt.Fprintln(os.Stderr, "Error:", err)
             w.WriteHeader(http.StatusInternalServerError)
             return
         }
         w.WriteHeader(http.StatusOK)
-        for _,s:=range strings{
-            d.incomming_urls<-s
-        }
+        d.incomming_urls<-s
     } else{
         http.NotFound(w,r)
     }
@@ -229,9 +227,9 @@ func main() {
     }
 
     downloader:=make_downloader()
-    downloader.wg.Add(11)
+    downloader.wg.Add(6)
     go downloader.run_file_writer()
-    for i:=0;i<10;i++{
+    for i:=0;i<5;i++{
         go downloader.run_downloader()
     }
 
