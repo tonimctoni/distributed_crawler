@@ -234,7 +234,7 @@ func read_list_file(filename string) ([]string, error){
 
 func main() {
     if len(os.Args)!=2{
-        fmt.Fprintln(os.Stderr, "Error: Reservoir expects address to listen to as only parameter")
+        fmt.Fprintln(os.Stderr, "Error: Expects address to listen to as only parameter")
         return
     }
 
