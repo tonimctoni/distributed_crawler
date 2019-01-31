@@ -2,6 +2,7 @@ package main;
 
 import "encoding/json"
 import "sync/atomic"
+import "crypto/md5"
 import "os/signal"
 import "io/ioutil"
 import "net/http"
@@ -32,17 +33,25 @@ func (c ContentTypeNotHtlm) Error() string{
     return "ContentTypeNotHtlm: is "+c.content_type
 }
 
+type Finished struct{}
+
 type Client struct{
     client http.Client
+    end_clients_flag *int64
     wg *sync.WaitGroup
     url_finder_re *regexp.Regexp
+    urls_to_distribute chan []string
+    distributer_finished chan Finished
 }
 
 func make_client() Client{
     return Client{
         http.Client{Timeout: 5*time.Second},
+        new(int64),
         new(sync.WaitGroup),
         regexp.MustCompile("(?:href=|src=|url=)[\"']?([^\"' <>]*)"),
+        make(chan []string),
+        make(chan Finished),
     }
 }
 
@@ -72,44 +81,6 @@ func (c Client) retrieve_urls_from_reservoir(reservoir_address string) ([]string
 
     return urls, nil
 }
-
-// func (c Client) send_urls_to_reservoir(reservoir_address string, urls []string) error{
-//     b:=&bytes.Buffer{}
-//     err:=json.NewEncoder(b).Encode(urls)
-//     if err!=nil{
-//         return err
-//     }
-
-//     r, err:=c.client.Post(reservoir_address_to_uri(reservoir_address), "application/json", b)
-//     if err!=nil{
-//         return err
-//     }
-
-//     if r.StatusCode!=http.StatusOK{
-//         return StatusCodeNotOk{r.StatusCode}
-//     }
-
-//     return nil
-// }
-
-// func (c Client) send_url_to_downloader(downloader_address string, url string) error{
-//     b:=&bytes.Buffer{}
-//     err:=json.NewEncoder(b).Encode(url)
-//     if err!=nil{
-//         return err
-//     }
-
-//     r, err:=c.client.Post(downloader_address_to_uri(downloader_address), "application/json", b)
-//     if err!=nil{
-//         return err
-//     }
-
-//     if r.StatusCode!=http.StatusOK{
-//         return StatusCodeNotOk{r.StatusCode}
-//     }
-
-//     return nil
-// }
 
 func (c Client) send_to(uri string, to_send interface{}) error{
     b:=&bytes.Buffer{}
@@ -173,11 +144,11 @@ func (c Client) get_html(url string) ([]byte, error){
     return ioutil.ReadAll(r.Body)
 }
 
-func (c Client) run_client(reservoir_addresses []string, downloader_address string, end *int64){
+func (c Client) run_client(reservoir_addresses []string){
     defer c.wg.Done()
     outer: for{
         for _,reservoir_address:=range reservoir_addresses{
-            if atomic.LoadInt64(end)!=0{
+            if atomic.LoadInt64(c.end_clients_flag)!=0{
                 break outer
             }
 
@@ -191,15 +162,7 @@ func (c Client) run_client(reservoir_addresses []string, downloader_address stri
             for _,url:=range urls{
                 html_content, err:=c.get_html(url)
                 if err!=nil{
-                    if ctnh,ok:=err.(ContentTypeNotHtlm); ok{
-                        if strings.Contains(ctnh.content_type, "image/png"){
-                            err=c.send_to(downloader_address_to_uri(downloader_address), url)
-                            if err!=nil{
-                                fmt.Fprintln(os.Stderr, "Error:", err)
-                                continue
-                            }
-                        }
-                    }else{
+                    if _,ok:=err.(ContentTypeNotHtlm); !ok{
                         fmt.Fprintln(os.Stderr, "Error:", err)
                     }
                     continue
@@ -211,35 +174,114 @@ func (c Client) run_client(reservoir_addresses []string, downloader_address stri
                     continue
                 }
 
-                err=c.send_to(reservoir_address_to_uri(reservoir_address), new_urls)
-                if err!=nil{
-                    fmt.Fprintln(os.Stderr, "Error:", err)
+                c.urls_to_distribute <- new_urls
+            }
+        }
+    }
+}
+
+func (c Client) send_distributed_urls_to_reservoirs(reservoir_addresses []string, urls_to_send [][]string){
+    for i,reservoir_address:=range reservoir_addresses{
+        if len(urls_to_send[i])==0{
+            continue
+        }
+
+        b:=&bytes.Buffer{}
+        err:=json.NewEncoder(b).Encode(urls_to_send[i])
+        if err!=nil{
+            fmt.Fprintln(os.Stderr, "Error:", err)
+            continue
+        }
+
+        response, err:=c.client.Post(reservoir_address_to_uri(reservoir_address), "application/json", b)
+        if err!=nil{
+            fmt.Fprintln(os.Stderr, "Error:", err)
+            continue
+        }
+        response.Body.Close()
+
+        if response.StatusCode!=http.StatusOK{
+            err=StatusCodeNotOk{response.StatusCode}
+            fmt.Fprintln(os.Stderr, "Error:", err)
+            continue
+        }
+    }
+}
+
+
+func distribute_urls(distributed_urls [][]string, urls []string) [][]string{
+    for _,s:=range(urls){
+        hash_bytes:=md5.Sum([]byte(s))
+        hash:=uint64(0)
+        for i:=uint(0);i<8;i++{
+            hash|=uint64(hash_bytes[i])<<(i*8)
+        }
+        bucket:=hash%uint64(len(distributed_urls))
+        distributed_urls[bucket]=append(distributed_urls[bucket], s)
+    }
+
+    return distributed_urls
+}
+
+func (c Client) run_distributer(reservoir_addresses []string){
+    defer close(c.distributer_finished)
+
+    distributed_urls:=make([][]string, len(reservoir_addresses))
+    distributed_urls_empty:=true
+    ticker:=time.NewTicker(10*time.Second)
+    defer ticker.Stop()
+
+    outer: for{
+        select{
+        case urls, open:=<-c.urls_to_distribute:
+            if len(urls)!=0{
+                distributed_urls=distribute_urls(distributed_urls, urls)
+                distributed_urls_empty=false
+            }
+
+            if !open{
+                if distributed_urls_empty==false{
+                    c.send_distributed_urls_to_reservoirs(reservoir_addresses, distributed_urls)
                 }
+                break outer
+            }
+
+        case <-ticker.C:
+            if distributed_urls_empty==false{
+                c.send_distributed_urls_to_reservoirs(reservoir_addresses, distributed_urls)
+                distributed_urls=make([][]string, len(reservoir_addresses))
+                distributed_urls_empty=true
             }
         }
     }
 }
 
 func main() {
-    if len(os.Args)<2{
-        fmt.Fprintln(os.Stderr, "Error: expects at least two addresses as parameter: the downloader address and the addresses of the reservoirs")
+    reservoir_addresses:=strings.Fields(os.Getenv("DCRAWLER_RESERVOIR_ADDRESSES"))
+    if len(reservoir_addresses)==0{
+        fmt.Fprintln(os.Stderr, "Error:", "DCRAWLER_RESERVOIR_ADDRESSES is not set")
         return
     }
 
-    end:=new(int64)
     client:=make_client()
     client.wg.Add(32)
     for i:=0;i<32;i++{
-        go client.run_client(os.Args[2:], os.Args[1], end)
+        go client.run_client(reservoir_addresses)
     }
+
+    go client.run_distributer(reservoir_addresses)
 
     sigterm:=make(chan os.Signal)
     signal.Notify(sigterm, os.Interrupt, syscall.SIGTERM)
     fmt.Println("Start")
 
     <-sigterm
-    atomic.StoreInt64(end, 1)
+    atomic.StoreInt64(client.end_clients_flag, 1)
     fmt.Println("End flag set")
     client.wg.Wait()
+    fmt.Println("Clients finished")
+    close(client.urls_to_distribute)
+    <-client.distributer_finished
+    fmt.Println("Distributer finished")
     fmt.Println("End")
 }

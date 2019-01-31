@@ -76,6 +76,7 @@ type Reservoir struct{
     get chan []string
     to_file chan ToFile
     wg *sync.WaitGroup
+    end chan End
 }
 
 func make_reservoir() Reservoir{
@@ -84,6 +85,7 @@ func make_reservoir() Reservoir{
         make(chan []string),
         make(chan ToFile, 1024),
         new(sync.WaitGroup),
+        make(chan End),
     }
 }
 
@@ -109,7 +111,7 @@ func (re Reservoir) ServeHTTP(w http.ResponseWriter, r *http.Request){
     }
 }
 
-func (re Reservoir) run_reservoir(initial_strings []string, n_discard uint, max_get uint, end chan End){
+func (re Reservoir) run_reservoir(initial_strings []string, n_discard uint, max_get uint){
     defer re.wg.Done()
     defer close(re.to_file)
     to_get:=make([]string,0,max_get)
@@ -154,7 +156,7 @@ func (re Reservoir) run_reservoir(initial_strings []string, n_discard uint, max_
             for i:=uint(0);i<max_get && reservoir.len!=0;i++{
                 to_get=append(to_get, reservoir.pop())
             }
-        case <- end:
+        case <- re.end:
             break outer
         }
     }
@@ -233,12 +235,13 @@ func read_list_file(filename string) ([]string, error){
 }
 
 func main() {
-    if len(os.Args)!=2{
-        fmt.Fprintln(os.Stderr, "Error: Expects address to listen to as only parameter")
+    listen_address:=os.Getenv("DCRAWLER_RESERVOIR_LISTEN_ADDRESS")
+    if len(listen_address)==0{
+        fmt.Fprintln(os.Stderr, "Error:", "DCRAWLER_RESERVOIR_LISTEN_ADDRESS is not set")
         return
     }
 
-    strings, err:=read_list_file("strings.txt")
+    initial_strings, err:=read_list_file("strings.txt")
     if err!=nil{
         fmt.Fprintln(os.Stderr, "Error:", err)
         return
@@ -256,13 +259,12 @@ func main() {
 
     reservoir:=make_reservoir()
     reservoir.wg.Add(2)
-    end_reservoir:=make(chan End)
-    go reservoir.run_reservoir(strings,uint(to_discard),32,end_reservoir)
+    go reservoir.run_reservoir(initial_strings,uint(to_discard),32)
     go reservoir.run_file_writer()
 
     mux:=http.NewServeMux()
     server:=&http.Server{
-        Addr: os.Args[1],
+        Addr: listen_address,
         ReadTimeout: 5*time.Second,
         WriteTimeout: 5*time.Second,
         IdleTimeout: 5*time.Second,
@@ -281,7 +283,7 @@ func main() {
     err=server.ListenAndServe()
     fmt.Fprintln(os.Stderr, err)
 
-    close(end_reservoir)
+    close(reservoir.end)
     reservoir.wg.Wait()
     fmt.Println("End")
 }
